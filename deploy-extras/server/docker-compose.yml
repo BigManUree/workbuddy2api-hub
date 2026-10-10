@@ -1,0 +1,23 @@
+# WB2api-Hub — production compose as deployed.
+# Host port 7863 -> container 8788 (reuse whatever your cloud security group
+# already allows). API key is auto-generated into ./accounts/settings.json.
+#
+# Deploy:
+#   mkdir -p /opt/wb2api-hub && cp docker-compose.yml /opt/wb2api-hub/
+#   cd /opt/wb2api-hub && docker compose up -d
+# Update:
+#   docker compose pull && docker compose up -d
+services:
+  wb-proxy:
+    image: ghcr.io/ardeyouxipianyi/workbuddy2api-hub:latest
+    container_name: wb-proxy
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:7863:8788"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8788
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./accounts:/app/accounts
+      - ./usage:/app/usage
