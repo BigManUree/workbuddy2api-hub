@@ -66,13 +66,25 @@ Claude Code 的 `~/.claude/settings.json` 示例：
 `%AppData%\Microsoft\Windows\Start Menu\Programs\Startup`，
 并按需修改其中的脚本路径。
 
+可选：再注册一个计划任务看门狗，代理意外退出后最多 5 分钟自动拉回
+（脚本自带单实例保护，重复运行会直接退出，注册看门狗是安全的）：
+
+```powershell
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"C:\...\wb2api-failover.vbs"'
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+Register-ScheduledTask -TaskName 'WB2apiFailoverWatchdog' -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
 ## 工作机制与踩坑记录
 
-1. **调度池动态生成**：启动时 GET 网关 `/v1/models`，`PRIORITY_MODELS`（能力优先）排前，其余模型自动追加；上游新增模型重启代理即自动入池。拉取失败则用内置 `FALLBACK_CHAIN`。
+1. **调度池动态生成**：启动时 GET 网关 `/v1/models`，`PRIORITY_MODELS`（能力优先）排前，其余模型自动追加；上游新增模型重启代理即自动入池。拉取失败则用内置 `FALLBACK_CHAIN`（不退出进程）。
 2. **限流不是 HTTP 429**：网关对"已知冷却"返回 **HTTP 200 + 错误信封** `{"type":"error","error":{"type":"rate_limit_error","message":"... retry in Ns ... frequency limit"}}`。代理同时识别 429 与该错误信封才会降级。
 3. **流式与非流式按 Content-Type 分流**：`text/event-stream` 逐块实时透传（不能缓冲，否则破坏流式并超时）；JSON 响应缓冲后检查内容。
 4. **冷却缓存**：从 `retry in Ns` 解析到期时间存入内存，`auto` 时直接跳过冷却中的模型；全部冷却时才向客户端返回最后的限流错误。
 5. 测试推理模型时 `max_tokens` 不要设太小，否则额度全用于思考、content 为空（stop_reason=max_tokens）。
+6. **pythonw 无控制台陷阱**：pythonw 下 `sys.stdout/stderr` 为 `None`，任何 `print`（包括异常 traceback）都会直接让线程/进程静默死亡。脚本启动时会把 stdio 重定向到脚本旁的 `wb2api-failover.log`（超 1MB 自动轮转），运行日志也写入该文件——代理异常时先看这个日志。
+7. **单实例保证**：Windows 的 SO_REUSEADDR 允许两个进程绑定同一端口（连接随机落到其一）。脚本启动时先探测端口，且以 `allow_reuse_address=False` 绑定，重复启动要么探针命中退出、要么绑定失败退出，不会叠加实例。
 
 ## 安全建议
 

@@ -20,10 +20,49 @@ import http.server
 import json
 import os
 import re
+import socket
 import socketserver
+import sys
 import time
 
 import requests
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(SCRIPT_DIR, "wb2api-failover.log")
+
+
+def log(msg):
+    """Append one timestamped line to the proxy log file."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def _setup_stdio():
+    """pythonw has no console: sys.stdout/stderr are None.
+
+    A handler thread that hit an exception would then fail while printing
+    the traceback and die without ever closing the socket — the client
+    sees zero bytes until it times out. Redirect stdio to the log file so
+    output (and tracebacks) always have somewhere to go.
+    """
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
+                os.remove(LOG_PATH)
+        except OSError:
+            pass
+        fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = fh
+        if sys.stderr is None:
+            sys.stderr = fh
+
+
+_setup_stdio()
 
 
 def _load_dotenv():
@@ -97,12 +136,12 @@ def build_chain():
         )
         ids = [m.get("id") for m in resp.json().get("data", []) if m.get("id")]
     except Exception as exc:
-        print("model list fetch failed (%s); using fallback chain" % exc)
+        log("model list fetch failed (%s); using fallback chain" % exc)
         return FALLBACK_CHAIN
     ids = list(dict.fromkeys(ids))  # de-dup, preserve order
     ordered = [m for m in PRIORITY_MODELS if m in ids]
     ordered += [m for m in ids if m not in ordered]
-    print("pool (%d models): %s" % (len(ordered), ", ".join(ordered)))
+    log("pool (%d models): %s" % (len(ordered), ", ".join(ordered)))
     return ordered
 
 HOP_BY_HOP = {
@@ -230,33 +269,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers = self._base_headers()
         url = TARGET + self.path
         last_detail = b""
+        log("POST %s requested=%r trying: %s" %
+            (self.path, parsed.get("model"), ", ".join(chain[:4])))
 
         for model in chain:
             body = dict(parsed)
             body["model"] = model
             data = json.dumps(body).encode("utf-8")
+            t0 = time.time()
             try:
                 upstream = requests.request(
                     self.command, url, headers=headers, data=data,
-                    stream=True, timeout=(30, 600), allow_redirects=False,
+                    # Connect must be quick; a stalled model must not pin the
+                    # whole auto chain — rotate if no data flows within 60s.
+                    stream=True, timeout=(10, 60), allow_redirects=False,
                 )
             except requests.RequestException as exc:
-                payload = ("upstream error: %s" % exc).encode()
-                self.send_response(502)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-                return
+                # Transient/stalled upstream for this model: try the next one.
+                log("model %s upstream error after %.1fs: %s" %
+                    (model, time.time() - t0, exc))
+                continue
 
             status = upstream.status_code
             ctype = upstream.headers.get("Content-Type", "").lower()
+            log("model %s -> HTTP %d %s (%.1fs)" %
+                (model, status, ctype, time.time() - t0))
 
             # Real SSE stream: relay chunks live. (A cooled model comes back as
             # application/json, not event-stream, so it never reaches here.)
             if status not in (429,) and "text/event-stream" in ctype:
                 self._relay_headers(upstream)
                 self._stream_back(upstream)
+                log("model %s stream relayed, done" % model)
                 return
 
             # Non-stream body: buffer once and inspect it.
@@ -266,6 +310,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 remember_cooldown(model, detail)
                 last_detail = detail
                 upstream.close()
+                log("model %s unavailable, rotating" % model)
                 continue
 
             # success: relay the buffered JSON straight back
@@ -343,12 +388,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows SO_REUSEADDR lets a second copy bind the "same" port while the
+    # first is listening (connections then land on either process). Binding
+    # without it fails atomically, which is the single-instance guarantee.
+    allow_reuse_address = False
 
 
 if __name__ == "__main__":
+    # Fast path: if something already answers on the port, exit quietly.
+    try:
+        probe = socket.create_connection((LISTEN_HOST, LISTEN_PORT), timeout=1)
+        probe.close()
+        log("already running on %s:%d, exiting" % (LISTEN_HOST, LISTEN_PORT))
+        sys.exit(0)
+    except OSError:
+        pass
+
     MODEL_CHAIN = build_chain()
-    server = ThreadingServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    print("model failover proxy on http://%s:%d -> %s" %
-          (LISTEN_HOST, LISTEN_PORT, TARGET))
+    # Bind failure (WSAEADDRINUSE) means another copy won the race at boot
+    # (startup VBS and the watchdog can fire within the same second).
+    try:
+        server = ThreadingServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    except OSError:
+        log("port %d already bound by another instance, exiting" % LISTEN_PORT)
+        sys.exit(0)
+    log("model failover proxy on http://%s:%d -> %s" %
+        (LISTEN_HOST, LISTEN_PORT, TARGET))
     server.serve_forever()
